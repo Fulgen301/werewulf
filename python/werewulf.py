@@ -197,7 +197,7 @@ class Game(object):
 		self.chosen_set = self.role_sets["standard"]
 
 		while True:
-			role = input("Please specify the role which you want to play.\nAvailable: {}, Spectator\n> ".format(", ".join(i.__name__ for i in self.chosen_set)))
+			role = input("Please specify the role you want to play.\nAvailable: {}, Spectator\n> ".format(", ".join(i.__name__ for i in self.chosen_set)))
 			
 			if role == "Spectator":
 				break
