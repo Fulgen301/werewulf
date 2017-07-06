@@ -48,7 +48,7 @@ class BasicRole(object):
 	index = 0
 	
 	def __repr__(self) -> str:
-		return self.__class__.__name__
+		return self.__class__.__name__.lower()
 	
 	def __call__(self, game : Game, person : Person) -> bool:
 		return True
@@ -197,7 +197,7 @@ class Game(object):
 		self.chosen_set = self.role_sets["standard"]
 
 		while True:
-			role = input("Please specify the role which you want to play.\nAvailable: {}\n> ".format(", ".join(str(i) for i in self.chosen_set)))
+			role = input("Please specify the role which you want to play.\nAvailable: {}, Spectator\n> ".format(", ".join(i.__name__ for i in self.chosen_set)))
 			
 			if role == "Spectator":
 				break
