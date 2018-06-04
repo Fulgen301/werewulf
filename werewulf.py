@@ -1,35 +1,32 @@
 #!/usr/bin/env python3
 
-from _thread import start_new_thread
-from functools import wraps
 from enum import IntEnum
 from bs4 import BeautifulSoup
 import random
-import socket, socketserver
-sys = socket.sys
+import sys
 import threading
 import pickle
 import warnings
 import time
 import re
+import enet
+import asyncio
+
+PORT = 9621
 
 if sys.version_info < (3,6):
-    raise RuntimeError(f"Python version {sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro} lower than 3.6")
-
+    raise RuntimeError("Python version {} lower than 3.6".format(sys.version_info))
 class Time(IntEnum):
     Day = 1
     Night = 2
     Both = 3
 
 class MessageType(IntEnum):
-    GameOpen = 0
-    NewClient = 1
-    Update = 2
-    GameState = 3
-    Reset = 4
-    PlayerInput = 5
-    RemoveClient = 6
-    Ping = 7
+    Unknown = -1
+    Update = 1
+    GameState = 2
+    Reset = 3
+    PlayerInput = 4
 
 class GameState(IntEnum):
     Lobby = 0
@@ -65,6 +62,7 @@ class Person(object):
     @classmethod
     def withNameFromList(cls, role : BasicRole, game : Game, AI : bool = True, name_list : list = None, client = None) -> Person:
         name = None
+        assert name_list
         if name_list:
             random.shuffle(name_list)
             name = name_list.pop()
@@ -83,6 +81,9 @@ class Person(object):
 
     def getVoteTarget(self):
         return self.role.getVoteTarget(self.game, self)
+    
+    def isHostile(self):
+        return self.role.isHostile()
 
 class BasicRole(object):
     time = Time.Day
@@ -99,6 +100,9 @@ class BasicRole(object):
 
     def isValidVoteTarget(self, person : Person) -> bool:
         return True
+    
+    def isHostile(self) -> bool:
+        return False
 
     def getVoteTarget(self, game : Game, person : Person) -> Person:
         if person.AI:
@@ -138,6 +142,9 @@ class Roles(object):
 
         def isValidVoteTarget(self, person : Person) -> bool:
             return not isinstance(person.role, type(self))
+        
+        def isHostile(self) -> bool:
+            return True
     
     class Villager(BasicRole):
         time = Time.Day
@@ -201,9 +208,10 @@ class Roles(object):
     class Seer(BasicRole):
         time = Time.Night
         index = 7
+        last = None
 
         def __call__(self, game : Game, person : Person) -> bool:
-            if person.AI == False and person.alive:
+            if person.AI == False:
                 while True:
                     victim = game.getPlayer(input("Enter the name of a person you want to see the role of: \n> "), lambda x: x.alive and x.killable and type(x.role) != type(self))
                     if victim:
@@ -211,16 +219,21 @@ class Roles(object):
                         break
                     else:
                         print(f"Invalid person.")
-
+            else:
+                victim = random.choice(list(game.getPlayersByFilter(lambda p: p != self.last and p.alive and p.killable and p.isHostile())))
+                if victim:
+                    self.last = victim
             return True
-
-def sync(f):
-    def wrapper(*args, **kwargs):
-        f(*args, **kwargs)
-    return wrapper
+        
+        def getVoteTarget(self, game : Game, person : Person) -> Person:
+            if not person.AI:
+                return super().getVoteTarget(game, person)
+            elif self.last and self.last.alive and self.last.killable:
+                return self.last
             
 
 class Game(object):
+    loop = None
     people = []
     player_count = 8
     player_role = None
@@ -240,18 +253,29 @@ class Game(object):
     status = GameState.Lobby
     spectator = False
     nick = "Player"
+    clients = []
     
     name_list = ["Alpha", "Beta", "Gamma", "Delta", "Max", "John", "Valentin", "Sarah", "Jane", "Ypsilon"]
     sync_attrs = ["people", "player_count", "_current_victims", "accused"]
     
-    def __init__(self) -> None:
+    def __init__(self, loop) -> None:
+        self.loop = loop
         print("Welcome to Werewulf.")
         self.selectNetworkMode()
         if not self.isNetwork():
             self.main()
         else:
             self.startLobby()
-
+    
+    def __getstate__(self) -> dict:
+        state = dict()
+        for i in self.sync_attr:
+            state[i] = getattr(self, i)
+        return state
+    
+    def __setstate__(self, state) -> None:
+        self.__dict__.update(state)
+    
     def selectNetworkMode(self) -> None:
         while True:
             c = input("Do you want to host or join a multiplayer game, or just play alone with an AI?\n(host, join, alone)\n>")
@@ -282,17 +306,20 @@ class Game(object):
         
         if self.isClient():
             return
-
-        while True:
-            role = input("Do you want to be a spectator? (y/n)\n> ")
-            
-            if role == "y":
-                self.spectator = True
-            break
+        
+        if self.isHost():
+            while True:
+                role = input("Do you want to be a spectator? (y/n)\n> ")
+                
+                if role == "y":
+                    self.spectator = True
+                break
         
         while True:
             try:
                 self.player_count = int(input("Please specify the player count.\n> ")) - 1
+                while len(self.name_list) < self.player_count:
+                    self.name_list.append(f"Player {len(self.name_list)}")
                 break
             except ValueError:
                 print("ERROR: You did not enter a valid integer.")
@@ -302,14 +329,12 @@ class Game(object):
 
     def joinGame(self) -> None:
         while True:
-            addr = input("Enter the host name or the ip address of the host:\n> ")
-            if not re.match("([0-9]{1,3}|\.)", addr):
-                try:
-                    addr = socket.gethostbyname(addr)
-                    if not re.match("([0-9]{1,3}|\.)", addr):
-                        raise OSError
-                except Exception:
-                    print("ERROR: The entered host name is invalid.")
+            try:
+                addr = enet.Address(input("Enter the host name or the ip address of the host:\n> "), PORT)
+            except OSError:
+                print("ERROR: The entered host name is invalid.")
+                continue
+            
 
             self.network = WWNetworkUDPClient(self, addr)
             self.network.sendToHost(self.network.createMessage(MessageType.GameOpen))
@@ -323,9 +348,12 @@ class Game(object):
                 print("ERROR: It seems that the specified device does not run any valid games.")
         self.network.sendToHost(self.network.createMessage(MessageType.NewClient, self.network.getExternalIPAddress(), self.nick, self.spectator))
 
-    def startLobby(self) -> None:
+    async def startLobby(self) -> None:
+        if not self.isNetwork():
+            return
+        
         if self.isHost():
-            start_new_thread(self.checkMessages, ())
+            threading.Thread(target=self.checkMessages).start()
 
         while self.status == GameState.Lobby:
             ipt = input("Chat:|> ")
@@ -405,10 +433,10 @@ class Game(object):
         
         for role in last:
             for i in range(needed // len(last)):
-                self.addAI(role(), None, self, True)
+                self.addAI(role(), None, True)
     
-    def main(self) -> None:
-
+    async def main(self) -> None:
+        await self.startLobby()
         print("END: Lobby")
         if not self.isClient():
             old_maxplayer = self.player_count
@@ -430,7 +458,9 @@ class Game(object):
             
             if self.isHost():
                 self.sendReset()
-        
+            
+            if not self.spectator:
+                print(f"You are a {self.getHumanPlayer()}") # FIXME
             while self.night() and self.day(): pass
     
     def day(self) -> bool:
@@ -543,16 +573,13 @@ class Game(object):
     def checkFulfilled(self, time=None):
         res = list(self.getPlayersByFilter(lambda person: person.alive and person.role.hasWon(self, time) and ((time and person.time & time) or True)))
         if len(res):
-            self.log("{} have won.".format(", ".join(f"{i} ({i.role})" for i in res)))
+            self.log("{} ha{} won.".format(", ".join(f"{i} ({i.role})" for i in res), "ve" if len(res) > 1 else "s"))
             return True
 
     def doSync(self, f, *args) -> None:
         if not self.isHost():
             return
-
-        assert hasattr(f, "__name__")
-
-        msg = self.network.createMessage(MessageType.Update, {f.__name__ : args})
+        msg = self.network.createMessage(MessageType.Update, {f : args})
         self.network.sendToClients(msg)
 
     def sendReset(self) -> None:
@@ -603,55 +630,55 @@ class Game(object):
             name = self.getPlayerByFilter(lambda p: p.name == name)
         return name
 
-    @sync
-    def addAI(self, role : BasicRole, name : str = None, sync : bool = True, f : object = None) -> None:
+    
+    def addAI(self, role : BasicRole, name : str = None, sync : bool = True) -> None:
         if name == None:
             ai = Person.withNameFromList(role, self, True, self.name_list)
         else:
             ai = Person(role, self, True, name)
         
         self.people.append(ai)
-        if sync: self.doSync(f, role, name)
+        if sync: self.doSync("addAI", role, name)
 
-    @sync
-    def addVictim(self, victim : Person, sync : bool = True, f : object = None) -> None:
+    
+    def addVictim(self, victim : Person, sync : bool = True) -> None:
         if victim not in self._current_victims:
             self._current_victims.append(victim)
-            if sync: self.doSync(f, victim)
+            if sync: self.doSync("addVictim", victim)
 
-    @sync
-    def removeVictim(self, victim : Person, sync : bool = True,  f : object = None) -> None:
+    
+    def removeVictim(self, victim : Person, sync : bool = True) -> None:
         if victim in self._current_victims:
             self._current_victims.remove(victim)
-            if sync: self.doSync(f, victim)
+            if sync: self.doSync("removeVictim", victim)
 
-    @sync
-    def killPlayer(self, victim, sync : bool = True, f : object = None) -> None:
+    
+    def killPlayer(self, victim, sync : bool = True) -> None:
         victim = self.getPlayerByName(victim)
         if not (victim and isinstance(victim, Person)):
             return
 
         victim.kill()
-        if sync: self.doSync(f, victim)
+        if sync: self.doSync("killPlayer", victim)
 
-    @sync
-    def addAccusedPlayer(self, victim, votes : int = 0, sync : bool = True, f : object = None) -> None:
+    
+    def addAccusedPlayer(self, victim, votes : int = 0, sync : bool = True) -> None:
         victim = self.getPlayerByName(victim)
         if not isinstance(victim, Person):
             print("returned")
             return
 
         self.accused[victim] = votes
-        if sync: self.doSync(f, victim, votes)
+        if sync: self.doSync("addAccusedPlayer", victim, votes)
 
-    @sync
-    def removeAccusedPlayer(self, victim, sync : bool = True, f : object = None) -> None:
+    
+    def removeAccusedPlayer(self, victim, sync : bool = True) -> None:
         victim = self.getPlayerByName(victim)
         if not (victim and isinstance(victim, Person) and victim in self.accused):
             return
 
         del self.accused[victim]
-        #if sync: self.doSync(f, victim)
+        if sync: self.doSync("removeAccusedPlayer", victim)
 
     def getVictims(self) -> list:
         return self._current_victims[:] # return a copy to prevent hacking
@@ -686,41 +713,35 @@ class Game(object):
                     print(error_msg)
         return ipt
 
-    @sync
-    def log(self, message, client=None, sync = True, f = None) -> None:
+    
+    def log(self, message, client=None, sync = True) -> None:
         if not (self.isNetwork() and self.network.getExternalIPAddress() == client):
             pass
 
         print(message)
-        if sync: self.doSync(f, message)
+        if sync: self.doSync("log", message)
+    
+    async def startServer(self):
+        self.server = asyncio.start_server(self.handleIncomingPacket, "127.0.0.1", PORT, loop=self.loop)
+    
+    async def handleIncomingPacket(self, reader, writer):
+        pass
 
 #				#
 #	Network		#
 #				#
 
-class _WWUDPServerRequestHandler(socketserver.BaseRequestHandler):
-    def handle(self):
-        print("Request handle called")
-        self.server.server.handle(self, *(self.request))
-
 class InvalidMessageError(TypeError): pass
 class _Message(object): pass
 
-class _WWThreadedUDPServer(socketserver.ThreadingMixIn, socketserver.UDPServer):
-    server = None
-
-
 class WWNetworkUDP(object):
     lastmsg = None
-    port = None
-
-    def _assertSocket(self) -> None:
-        if not self.sock:
-            self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            self._bindSocket()
 
     def _assertIsValidIP(self, ip : str) -> None:
-        assert re.match("([0-9]{1,3}|\.)", ip), f"Invalid ip: {ip}"
+        try:
+            assert re.match("([0-9]{1,3}|\.)", ip), f"Invalid IP: {ip}"
+        except AssertionError:
+            assert re.match(r".*\.local", ip), f"Invalid IP: {ip}"
 
     def _assertIsValidMessage(self, msg : list) -> None:
         if type(msg) != list:
@@ -747,9 +768,9 @@ class WWNetworkUDP(object):
     def sendToHost(self, msg : object) -> None:
         pass
 
-    def requestMessage(self, msg_type : int, client : str = None, timeout : int = None) -> list:
+    def requestMessage(self, msg_type : int, peer : enet.Peer = None, timeout : int = None) -> list:
         start_time = time.time()
-        while not (self.lastmsg and self.lastmsg.msg[0] == msg_type and ((client and self.lastmsg.client == client or True))):
+        while not (self.lastmsg and self.lastmsg.msg[0] == msg_type and ((peer and self.lastmsg.peer == peer) or True)):
             if timeout and (time.time() - start_time) >= timeout:
                 raise TimeoutError
         return self.lastmsg.msg[:]
@@ -766,35 +787,26 @@ class WWNetworkUDP(object):
     def isServer(self) -> bool:
         return False
 
-class WWNetworkUDPClient(WWNetworkUDP):
-    server = None
-    sock = None
+class WWNetworkUDPClient(enet.Host, WWNetworkUDP):
     game = None
-
-    def __init__(self, game : Game, server : str, port : int = 9621) -> None:
+    peer = None
+    def __init__(self, game, addr) -> None:
         self.game = game
-        self.server = server
-        self.port = port
-        self._assertIsValidIP(server)
-        self.server = server
-        self._assertSocket()
-        start_new_thread(self.receive, ())
-    
-    def _bindSocket(self):
-        if not (self.server and self.port):
-            return
+        super().__init__(None, 1, 2, 0, 0)
+        self.connect(addr, 2, 0)
         
-        self.sock.bind(("", self.port))
+        if self.service(5000).type != enet.EVENT_TYPE_CONNECT:
+            raise ConnectionRefusedError(f"Couldn't connect to {addr.host}:{addr.port}")
+        
+        threading.Thread(target=self.receive).start()
     
     def receive(self):
         while True:
-            try:
-                data, address = self.sock.recvfrom(1024)
-                self.handle(data, address)
-            except socket.timeout:
-                raise
+            event = self.service(0)
+            if event.type == enet.EVENT_TYPE_RECEIVE:
+                self.handle(event.packet.data, event.address)
 
-    def handle(self, data : bytes, address : str) -> None:
+    def handle(self, data : bytes, address : enet.Address) -> None:
         try:
             msg = pickle.loads(data)
         except Exception: # not for us
@@ -834,123 +846,94 @@ class WWNetworkUDPClient(WWNetworkUDP):
                     else:
                         print(msg[3] if len(msg) >= 4 else "Please try again.")
 
-            self.sendToClient(self, self.createMessage(MessageType.PlayerInput, ipt))
+            self.sendToHost(self, self.createMessage(MessageType.PlayerInput, ipt))
 
         elif msg[0] == MessageType.GameState:
             self.game.status = msg[1]
 
-    def sendToClients(self, msg : object) -> None:
-        return self.sendToClient(msg)
-
-    def sendToClient(self, client : str, message : object) -> None:
-        return self.sendToHost(msg)
-
     def sendToHost(self, msg : object) -> None:
-        self._assertSocket()
         msg = pickle.dumps(msg) # no exception handling, because this must NOT fail
-        self.sock.sendto(msg, (self.server, self.port))
-
+        packet = enet.Packet(msg, enet.PACKET_FLAG_RELIABLE)
+        self.peers[0].send(0, packet)
+    
     def isClient(self) -> bool:
         return True
 
-class WWNetworkUDPServer(_WWThreadedUDPServer, WWNetworkUDP):
-    sock = None
-    __clients = list()
-    game = None
-    nicks = {}
-
-    def __init__(self, game : Game, port : int = 9621) -> None:
-        super().__init__(("", port), socketserver.BaseRequestHandler)
+class WWNetworkUDPServer(enet.Host, WWNetworkUDP):
+    def __init__(self, game) -> None:
+        super().__init__(enet.Address("localhost", PORT), 32, 2, 0, 0)
         self.game = game
-        self.ip, self.port = self.server_address
-
-        self._assertSocket()
-        start_new_thread(self.serve_forever, ())
-
+        threading.Thread(target=self.receive).start()
     
-    def finish_request(self, data, client_address) -> None:
-        msg = pickle.loads(data[0])
+    def receive(self) -> None:
+        while True:
+            event = self.service(0)
+            if event.type != 0:
+                print(f"Event:", event.type)
+            
+            if event.type == enet.EVENT_TYPE_RECEIVE:
+                self.handle(event.packet.data, event.peer)
+        
+    def handle(self, data : bytes, peer : enet.Peer) -> None:
+        msg = pickle.loads(data)
         self._assertIsValidMessage(msg)
 
         self.lastmsg = _Message()
         setattr(self.lastmsg, "msg", msg)
-        setattr(self.lastmsg, "client", client_address[0])
+        setattr(self.lastmsg, "client", peer)
 
         print(msg)
 
         if msg[0] == MessageType.GameOpen:
-            self.sendToClient(client_address[0], self.createMessage(MessageType.GameOpen, True))
-
-        elif msg[0] == MessageType.NewClient:
-            self.__clients.append(msg[1]) # client ip
-            self.nicks[msg[1]] = msg[2]
+            self.sendToClient(peer, self.createMessage(MessageType.GameOpen, True))
         
         elif msg[0] == MessageType.Update:
             # Format of msg: [type, {str(function name) : tuple(args), ...}]
-            clients = self.getClients()
-            clients.remove(client_address)
+            clients = self.getClients()[:]
+            clients.remove(peer)
             for c in clients:
                 self.sendToClient(c, msg)
+        
+        
+    def sendToClients(self, message : list) -> None:
+        packet = enet.Packet(pickle.dumps(message), enet.PACKET_FLAG_RELIABLE)
+        self.broadcast(0, packet)
 
-            if msg[1].get("log") and client_address not in self.nicks:
-                x = re.match("<(.*)>.*", msg[1]["log"])
-                if x:
-                    self.nicks[client_address] = x.group(1)
-
-        elif msg[0] == MessageType.RemoveClient:
-            if msg[1] in self.clients:
-                self.clients.remove(msg[1])
-            if msg[1] in self.nicks:
-                del self.nicks[msg[1]]
-
-    def sendToClients(self, message : object) -> None:
-        for client in self.__clients:
-            self.sendToClient(client, message)
-
-    def sendToClient(self, client : str, message : list) -> None:
-        self._assertSocket()
-        assert isinstance(message, list), f"{message}"
-        print(f"sendToClient: {message}")
-        message = pickle.dumps(message) # no exception handling, because this must NOT fail
-        self.sock.sendto(message, (client, self.port))
-
-    def getClientsByFilter(self, fltr : filter) -> filter:
-        return filter(fltr, self.__clients)
+    def sendToClient(self, peer : enet.Peer, message : list) -> None:
+        packet = enet.Packet(pickle.dumps(message), enet.PACKET_FLAG_RELIABLE) # no exception handling, because this must NOT fail
+        peer.send(0, packet)
 
     def getClients(self) -> list:
-        return self.__clients[:]
+        return self.peers
 
     def getClientCount(self) -> int:
-        return len(self.__clients)
-
-    def addClient(self, ip : str) -> None:
-        self._assertIsValidIP(ip)
-        self.__clients.append(ip)
-
-    def removeClient(self, ip : str) -> None:
-        if ip in self.__clients:
-            self.__clients.remove(ip)
+        return len(self.peers)
 
     def requestPlayerInput(self,
-                        client : str = None,
+                        peer : enet.Peer,
                         ipt_type : int = PlayerInput.String,
                         prompt : str = "> ",
                         error_msg : str = "Please try again.",
                         fltr : str = "lambda person: True") -> str:
+        
         msg = self.createMessage(MessageType.PlayerInput, ipt_type, prompt, error_msg, fltr)
-        self.sendToClient(client, msg)
+        
+        self.sendToClient(peer, msg)
+        
         msg = self.requestMessage(MessageType.PlayerInput, client)
         if len(msg) >= 2:
             return msg[1]
 
     def getAddress(self) -> str:
-        return self.ip
+        return self.address.host
 
     def getPort(self) -> int:
-        return self.port
+        return self.address.port
 
     def isServer(self) -> bool:
         return True
 
 if __name__ == "__main__":
-    g = Game()
+    loop = asyncio.get_event_loop()
+    g = Game(loop)
+    loop.run_until_complete(g.main())
